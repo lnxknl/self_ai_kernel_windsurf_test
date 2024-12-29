@@ -5,8 +5,10 @@
 #include <stdbool.h>
 #include <pthread.h>
 #include <time.h>
-#include <unistd.h>
 #include <errno.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <signal.h>
 
 // Logging Macros
 #define LOG_LEVEL_DEBUG 0
@@ -25,112 +27,119 @@
 // Global Log Level
 static int current_log_level = LOG_LEVEL_INFO;
 
-// Futex Operations
+// Scheduler Constants
+#define MAX_CPUS           16
+#define MAX_TASKS          1024
+#define MAX_PRIORITY       100
+#define MIN_PRIORITY       0
+#define DEFAULT_TIMESLICE  100000  // 100ms
+#define LOAD_BALANCE_INTERVAL 1000000  // 1s
+#define TEST_DURATION      30     // seconds
+
+// Task States
 typedef enum {
-    FUTEX_WAIT,
-    FUTEX_WAKE,
-    FUTEX_FD,
-    FUTEX_REQUEUE,
-    FUTEX_CMP_REQUEUE,
-    FUTEX_WAKE_OP,
-    FUTEX_LOCK_PI,
-    FUTEX_UNLOCK_PI,
-    FUTEX_TRYLOCK_PI,
-    FUTEX_WAIT_BITSET,
-    FUTEX_WAKE_BITSET
-} futex_op_t;
+    TASK_RUNNING,
+    TASK_READY,
+    TASK_BLOCKED,
+    TASK_SLEEPING,
+    TASK_DEAD
+} task_state_t;
 
-// Futex Flags
+// Task Types
 typedef enum {
-    FUTEX_PRIVATE     = 1 << 0,
-    FUTEX_CLOCK_RT    = 1 << 1,
-    FUTEX_SHARED      = 1 << 2,
-    FUTEX_REQUEUE_PI  = 1 << 3,
-    FUTEX_SYNC_PI     = 1 << 4
-} futex_flags_t;
+    TASK_NORMAL,
+    TASK_RT,
+    TASK_IDLE
+} task_type_t;
 
-// Waiter Structure
-typedef struct futex_waiter {
-    pthread_t thread;
-    uint32_t *uaddr;
-    uint32_t val;
-    struct timespec timeout;
-    bool active;
-    struct futex_waiter *next;
-} futex_waiter_t;
+// CPU States
+typedef enum {
+    CPU_ACTIVE,
+    CPU_IDLE,
+    CPU_OFFLINE
+} cpu_state_t;
 
-// Futex Queue Structure
-typedef struct futex_queue {
-    uint32_t *uaddr;
-    futex_waiter_t *waiters;
-    size_t waiter_count;
+// Task Structure
+typedef struct task {
+    unsigned int id;
+    task_type_t type;
+    task_state_t state;
+    int priority;
+    uint64_t runtime;
+    uint64_t timeslice;
+    uint64_t deadline;
+    int cpu;
+    struct task *next;
+} task_t;
+
+// Run Queue Structure
+typedef struct {
+    task_t *head;
+    size_t count;
+    uint64_t total_weight;
     pthread_mutex_t lock;
-    struct futex_queue *next;
-} futex_queue_t;
+} run_queue_t;
 
-// Futex Statistics
+// CPU Structure
 typedef struct {
-    unsigned long total_waits;
-    unsigned long total_wakes;
-    unsigned long total_requeues;
-    unsigned long failed_waits;
-    unsigned long timeout_waits;
-    double avg_wait_time;
-} futex_stats_t;
+    unsigned int id;
+    cpu_state_t state;
+    run_queue_t *queue;
+    task_t *current;
+    uint64_t idle_time;
+    uint64_t busy_time;
+    pthread_t thread;
+    pthread_mutex_t lock;
+} cpu_t;
 
-// Futex Configuration
+// Statistics Structure
 typedef struct {
-    size_t max_queues;
-    size_t max_waiters;
-    bool track_stats;
-    unsigned int requeue_batch;
-} futex_config_t;
+    uint64_t total_tasks;
+    uint64_t completed_tasks;
+    uint64_t migrations;
+    uint64_t context_switches;
+    uint64_t load_balances;
+    double avg_latency;
+    double cpu_utilization;
+    double load_imbalance;
+    double test_duration;
+} sched_stats_t;
 
-// Futex Manager
+// Scheduler Manager Structure
 typedef struct {
-    futex_queue_t *queues;
-    size_t queue_count;
-    futex_config_t config;
-    futex_stats_t stats;
+    cpu_t cpus[MAX_CPUS];
+    task_t *tasks[MAX_TASKS];
+    size_t nr_cpus;
+    size_t nr_tasks;
+    bool running;
     pthread_mutex_t manager_lock;
-} futex_manager_t;
+    pthread_t load_balancer;
+    sched_stats_t stats;
+} sched_manager_t;
 
 // Function Prototypes
 const char* get_log_level_string(int level);
-const char* get_futex_op_string(futex_op_t op);
+const char* get_task_state_string(task_state_t state);
+const char* get_task_type_string(task_type_t type);
+const char* get_cpu_state_string(cpu_state_t state);
 
-futex_manager_t* create_futex_manager(futex_config_t config);
-void destroy_futex_manager(futex_manager_t *manager);
+sched_manager_t* create_sched_manager(size_t nr_cpus);
+void destroy_sched_manager(sched_manager_t *manager);
 
-futex_queue_t* find_queue(futex_manager_t *manager, uint32_t *uaddr);
-futex_queue_t* create_queue(uint32_t *uaddr);
-void destroy_queue(futex_queue_t *queue);
+task_t* create_task(task_type_t type, int priority);
+void destroy_task(task_t *task);
 
-int futex_wait(
-    futex_manager_t *manager,
-    uint32_t *uaddr,
-    uint32_t val,
-    const struct timespec *timeout
-);
+void* cpu_thread(void *arg);
+void* load_balancer_thread(void *arg);
+void schedule_task(sched_manager_t *manager, task_t *task);
+void balance_load(sched_manager_t *manager);
 
-int futex_wake(
-    futex_manager_t *manager,
-    uint32_t *uaddr,
-    int nr_wake
-);
+void run_test(sched_manager_t *manager);
+void calculate_stats(sched_manager_t *manager);
+void print_test_stats(sched_manager_t *manager);
+void demonstrate_scheduler(void);
 
-int futex_requeue(
-    futex_manager_t *manager,
-    uint32_t *uaddr1,
-    uint32_t *uaddr2,
-    int nr_wake,
-    int nr_requeue
-);
-
-void print_futex_stats(futex_manager_t *manager);
-void demonstrate_futex(void);
-
-// Utility Function: Get Log Level String
+// Utility Functions
 const char* get_log_level_string(int level) {
     switch(level) {
         case LOG_LEVEL_DEBUG: return "DEBUG";
@@ -141,418 +150,452 @@ const char* get_log_level_string(int level) {
     }
 }
 
-// Utility Function: Get Futex Operation String
-const char* get_futex_op_string(futex_op_t op) {
-    switch(op) {
-        case FUTEX_WAIT:         return "WAIT";
-        case FUTEX_WAKE:         return "WAKE";
-        case FUTEX_FD:           return "FD";
-        case FUTEX_REQUEUE:      return "REQUEUE";
-        case FUTEX_CMP_REQUEUE:  return "CMP_REQUEUE";
-        case FUTEX_WAKE_OP:      return "WAKE_OP";
-        case FUTEX_LOCK_PI:      return "LOCK_PI";
-        case FUTEX_UNLOCK_PI:    return "UNLOCK_PI";
-        case FUTEX_TRYLOCK_PI:   return "TRYLOCK_PI";
-        case FUTEX_WAIT_BITSET:  return "WAIT_BITSET";
-        case FUTEX_WAKE_BITSET:  return "WAKE_BITSET";
+const char* get_task_state_string(task_state_t state) {
+    switch(state) {
+        case TASK_RUNNING:  return "RUNNING";
+        case TASK_READY:    return "READY";
+        case TASK_BLOCKED:  return "BLOCKED";
+        case TASK_SLEEPING: return "SLEEPING";
+        case TASK_DEAD:     return "DEAD";
         default: return "UNKNOWN";
     }
 }
 
-// Create Futex Manager
-futex_manager_t* create_futex_manager(futex_config_t config) {
-    futex_manager_t *manager = malloc(sizeof(futex_manager_t));
-    if (!manager) {
-        LOG(LOG_LEVEL_ERROR, "Failed to allocate futex manager");
+const char* get_task_type_string(task_type_t type) {
+    switch(type) {
+        case TASK_NORMAL: return "NORMAL";
+        case TASK_RT:     return "RT";
+        case TASK_IDLE:   return "IDLE";
+        default: return "UNKNOWN";
+    }
+}
+
+const char* get_cpu_state_string(cpu_state_t state) {
+    switch(state) {
+        case CPU_ACTIVE:  return "ACTIVE";
+        case CPU_IDLE:    return "IDLE";
+        case CPU_OFFLINE: return "OFFLINE";
+        default: return "UNKNOWN";
+    }
+}
+
+// Create Run Queue
+run_queue_t* create_run_queue(void) {
+    run_queue_t *queue = malloc(sizeof(run_queue_t));
+    if (!queue) return NULL;
+
+    queue->head = NULL;
+    queue->count = 0;
+    queue->total_weight = 0;
+    pthread_mutex_init(&queue->lock, NULL);
+
+    return queue;
+}
+
+// Create Task
+task_t* create_task(task_type_t type, int priority) {
+    task_t *task = malloc(sizeof(task_t));
+    if (!task) return NULL;
+
+    static unsigned int next_id = 0;
+    task->id = next_id++;
+    task->type = type;
+    task->state = TASK_READY;
+    task->priority = priority;
+    task->runtime = 0;
+    task->timeslice = DEFAULT_TIMESLICE;
+    task->deadline = 0;
+    task->cpu = -1;
+    task->next = NULL;
+
+    return task;
+}
+
+// Create Scheduler Manager
+sched_manager_t* create_sched_manager(size_t nr_cpus) {
+    if (nr_cpus > MAX_CPUS) {
+        LOG(LOG_LEVEL_ERROR, "Number of CPUs exceeds maximum");
         return NULL;
     }
 
-    manager->queues = NULL;
-    manager->queue_count = 0;
-    manager->config = config;
-    memset(&manager->stats, 0, sizeof(futex_stats_t));
-    
-    pthread_mutex_init(&manager->manager_lock, NULL);
+    sched_manager_t *manager = malloc(sizeof(sched_manager_t));
+    if (!manager) {
+        LOG(LOG_LEVEL_ERROR, "Failed to allocate scheduler manager");
+        return NULL;
+    }
 
-    LOG(LOG_LEVEL_DEBUG, "Created futex manager");
+    // Initialize CPUs
+    for (size_t i = 0; i < nr_cpus; i++) {
+        manager->cpus[i].id = i;
+        manager->cpus[i].state = CPU_ACTIVE;
+        manager->cpus[i].queue = create_run_queue();
+        if (!manager->cpus[i].queue) {
+            // Cleanup and return
+            for (size_t j = 0; j < i; j++) {
+                pthread_mutex_destroy(&manager->cpus[j].lock);
+                free(manager->cpus[j].queue);
+            }
+            free(manager);
+            return NULL;
+        }
+        manager->cpus[i].current = NULL;
+        manager->cpus[i].idle_time = 0;
+        manager->cpus[i].busy_time = 0;
+        pthread_mutex_init(&manager->cpus[i].lock, NULL);
+    }
+
+    manager->nr_cpus = nr_cpus;
+    manager->nr_tasks = 0;
+    manager->running = false;
+    pthread_mutex_init(&manager->manager_lock, NULL);
+    memset(&manager->stats, 0, sizeof(sched_stats_t));
+
+    LOG(LOG_LEVEL_DEBUG, "Created scheduler manager with %zu CPUs", nr_cpus);
     return manager;
 }
 
-// Create Futex Queue
-futex_queue_t* create_queue(uint32_t *uaddr) {
-    futex_queue_t *queue = malloc(sizeof(futex_queue_t));
-    if (!queue) {
-        LOG(LOG_LEVEL_ERROR, "Failed to allocate futex queue");
-        return NULL;
-    }
+// CPU Thread
+void* cpu_thread(void *arg) {
+    cpu_t *cpu = (cpu_t*)arg;
+    sched_manager_t *manager = (sched_manager_t*)((void**)arg)[1];
 
-    queue->uaddr = uaddr;
-    queue->waiters = NULL;
-    queue->waiter_count = 0;
-    pthread_mutex_init(&queue->lock, NULL);
-    queue->next = NULL;
+    while (manager->running) {
+        pthread_mutex_lock(&cpu->lock);
 
-    LOG(LOG_LEVEL_DEBUG, "Created futex queue for address %p", uaddr);
-    return queue;
-}
-
-// Find Futex Queue
-futex_queue_t* find_queue(futex_manager_t *manager, uint32_t *uaddr) {
-    pthread_mutex_lock(&manager->manager_lock);
-
-    futex_queue_t *queue = manager->queues;
-    while (queue) {
-        if (queue->uaddr == uaddr) {
-            pthread_mutex_unlock(&manager->manager_lock);
-            return queue;
-        }
-        queue = queue->next;
-    }
-
-    // Create new queue if not found
-    queue = create_queue(uaddr);
-    if (queue) {
-        queue->next = manager->queues;
-        manager->queues = queue;
-        manager->queue_count++;
-    }
-
-    pthread_mutex_unlock(&manager->manager_lock);
-    return queue;
-}
-
-// Futex Wait Operation
-int futex_wait(
-    futex_manager_t *manager,
-    uint32_t *uaddr,
-    uint32_t val,
-    const struct timespec *timeout
-) {
-    if (!manager || !uaddr) return -EINVAL;
-
-    futex_queue_t *queue = find_queue(manager, uaddr);
-    if (!queue) return -ENOMEM;
-
-    pthread_mutex_lock(&queue->lock);
-
-    // Check if value matches
-    if (*uaddr != val) {
-        pthread_mutex_unlock(&queue->lock);
-        if (manager->config.track_stats)
-            manager->stats.failed_waits++;
-        return -EAGAIN;
-    }
-
-    // Create waiter
-    futex_waiter_t *waiter = malloc(sizeof(futex_waiter_t));
-    if (!waiter) {
-        pthread_mutex_unlock(&queue->lock);
-        return -ENOMEM;
-    }
-
-    waiter->thread = pthread_self();
-    waiter->uaddr = uaddr;
-    waiter->val = val;
-    waiter->active = true;
-    
-    if (timeout)
-        waiter->timeout = *timeout;
-    
-    // Add to queue
-    waiter->next = queue->waiters;
-    queue->waiters = waiter;
-    queue->waiter_count++;
-
-    if (manager->config.track_stats)
-        manager->stats.total_waits++;
-
-    struct timespec start_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-
-    // Wait for wake
-    while (waiter->active) {
-        if (timeout) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
+        if (cpu->current) {
+            // Process current task
+            task_t *task = cpu->current;
             
-            if ((now.tv_sec > timeout->tv_sec) ||
-                (now.tv_sec == timeout->tv_sec && 
-                 now.tv_nsec >= timeout->tv_nsec)) {
-                waiter->active = false;
-                if (manager->config.track_stats)
-                    manager->stats.timeout_waits++;
-                break;
+            // Simulate task execution
+            usleep(task->timeslice);
+            task->runtime += task->timeslice;
+            cpu->busy_time += task->timeslice;
+
+            // Check if task is complete
+            if (task->runtime >= task->deadline) {
+                task->state = TASK_DEAD;
+                cpu->current = NULL;
+                manager->stats.completed_tasks++;
+            } else {
+                // Put task back in queue
+                task->state = TASK_READY;
+                pthread_mutex_lock(&cpu->queue->lock);
+                task->next = cpu->queue->head;
+                cpu->queue->head = task;
+                cpu->queue->count++;
+                pthread_mutex_unlock(&cpu->queue->lock);
+                cpu->current = NULL;
             }
+
+            manager->stats.context_switches++;
         }
-        pthread_mutex_unlock(&queue->lock);
-        usleep(1000);  // Simulate wait
-        pthread_mutex_lock(&queue->lock);
-    }
 
-    // Update statistics
-    if (manager->config.track_stats) {
-        struct timespec end_time;
-        clock_gettime(CLOCK_MONOTONIC, &end_time);
-        
-        double wait_time = 
-            (end_time.tv_sec - start_time.tv_sec) * 1000.0 +
-            (end_time.tv_nsec - start_time.tv_nsec) / 1000000.0;
-            
-        manager->stats.avg_wait_time = 
-            (manager->stats.avg_wait_time * 
-                (manager->stats.total_waits - 1) + wait_time) /
-            manager->stats.total_waits;
-    }
-
-    // Remove from queue
-    futex_waiter_t *prev = NULL;
-    futex_waiter_t *curr = queue->waiters;
-    
-    while (curr) {
-        if (curr == waiter) {
-            if (prev)
-                prev->next = curr->next;
-            else
-                queue->waiters = curr->next;
-            break;
+        // Get next task
+        pthread_mutex_lock(&cpu->queue->lock);
+        if (cpu->queue->head) {
+            cpu->current = cpu->queue->head;
+            cpu->queue->head = cpu->queue->head->next;
+            cpu->queue->count--;
+            cpu->current->state = TASK_RUNNING;
+            cpu->current->next = NULL;
+            cpu->state = CPU_ACTIVE;
+        } else {
+            cpu->state = CPU_IDLE;
+            cpu->idle_time += DEFAULT_TIMESLICE;
+            usleep(DEFAULT_TIMESLICE);
         }
-        prev = curr;
-        curr = curr->next;
+        pthread_mutex_unlock(&cpu->queue->lock);
+
+        pthread_mutex_unlock(&cpu->lock);
     }
 
-    queue->waiter_count--;
-    free(waiter);
-
-    pthread_mutex_unlock(&queue->lock);
-    return 0;
+    return NULL;
 }
 
-// Futex Wake Operation
-int futex_wake(
-    futex_manager_t *manager,
-    uint32_t *uaddr,
-    int nr_wake
-) {
-    if (!manager || !uaddr || nr_wake < 0) return -EINVAL;
+// Load Balancer Thread
+void* load_balancer_thread(void *arg) {
+    sched_manager_t *manager = (sched_manager_t*)arg;
 
-    futex_queue_t *queue = find_queue(manager, uaddr);
-    if (!queue) return 0;
-
-    pthread_mutex_lock(&queue->lock);
-
-    int woken = 0;
-    futex_waiter_t *waiter = queue->waiters;
-    
-    while (waiter && woken < nr_wake) {
-        if (waiter->active) {
-            waiter->active = false;
-            woken++;
-        }
-        waiter = waiter->next;
+    while (manager->running) {
+        balance_load(manager);
+        usleep(LOAD_BALANCE_INTERVAL);
     }
 
-    if (manager->config.track_stats)
-        manager->stats.total_wakes += woken;
-
-    pthread_mutex_unlock(&queue->lock);
-    return woken;
+    return NULL;
 }
 
-// Futex Requeue Operation
-int futex_requeue(
-    futex_manager_t *manager,
-    uint32_t *uaddr1,
-    uint32_t *uaddr2,
-    int nr_wake,
-    int nr_requeue
-) {
-    if (!manager || !uaddr1 || !uaddr2 || 
-        nr_wake < 0 || nr_requeue < 0)
-        return -EINVAL;
+// Schedule Task
+void schedule_task(sched_manager_t *manager, task_t *task) {
+    if (!manager || !task) return;
 
-    futex_queue_t *queue1 = find_queue(manager, uaddr1);
-    if (!queue1) return 0;
+    // Find least loaded CPU
+    size_t target_cpu = 0;
+    size_t min_tasks = UINT64_MAX;
 
-    futex_queue_t *queue2 = find_queue(manager, uaddr2);
-    if (!queue2) return 0;
-
-    pthread_mutex_lock(&queue1->lock);
-    pthread_mutex_lock(&queue2->lock);
-
-    int woken = 0;
-    int requeued = 0;
-    futex_waiter_t *waiter = queue1->waiters;
-    futex_waiter_t *prev = NULL;
-
-    while (waiter) {
-        futex_waiter_t *next = waiter->next;
-
-        if (waiter->active) {
-            if (woken < nr_wake) {
-                // Wake this waiter
-                waiter->active = false;
-                woken++;
-            } else if (requeued < nr_requeue) {
-                // Requeue this waiter
-                if (prev)
-                    prev->next = next;
-                else
-                    queue1->waiters = next;
-
-                waiter->next = queue2->waiters;
-                queue2->waiters = waiter;
-                waiter->uaddr = uaddr2;
-                
-                queue1->waiter_count--;
-                queue2->waiter_count++;
-                requeued++;
-                
-                waiter = next;
-                continue;
-            }
+    for (size_t i = 0; i < manager->nr_cpus; i++) {
+        pthread_mutex_lock(&manager->cpus[i].queue->lock);
+        if (manager->cpus[i].queue->count < min_tasks) {
+            min_tasks = manager->cpus[i].queue->count;
+            target_cpu = i;
         }
-        
-        prev = waiter;
-        waiter = next;
+        pthread_mutex_unlock(&manager->cpus[i].queue->lock);
     }
 
-    if (manager->config.track_stats) {
-        manager->stats.total_wakes += woken;
-        manager->stats.total_requeues += requeued;
-    }
+    // Assign task to CPU
+    cpu_t *cpu = &manager->cpus[target_cpu];
+    pthread_mutex_lock(&cpu->queue->lock);
+    task->cpu = target_cpu;
+    task->next = cpu->queue->head;
+    cpu->queue->head = task;
+    cpu->queue->count++;
+    pthread_mutex_unlock(&cpu->queue->lock);
 
-    pthread_mutex_unlock(&queue2->lock);
-    pthread_mutex_unlock(&queue1->lock);
-
-    return woken + requeued;
+    LOG(LOG_LEVEL_DEBUG, "Scheduled task %u (type: %s) to CPU %zu",
+        task->id, get_task_type_string(task->type), target_cpu);
 }
 
-// Print Futex Statistics
-void print_futex_stats(futex_manager_t *manager) {
+// Balance Load
+void balance_load(sched_manager_t *manager) {
     if (!manager) return;
 
-    pthread_mutex_lock(&manager->manager_lock);
+    // Find most and least loaded CPUs
+    size_t max_cpu = 0, min_cpu = 0;
+    size_t max_tasks = 0, min_tasks = UINT64_MAX;
 
-    printf("\nFutex Manager Statistics:\n");
-    printf("----------------------\n");
-    printf("Active Queues:     %zu\n", manager->queue_count);
-    printf("Total Waits:       %lu\n", manager->stats.total_waits);
-    printf("Total Wakes:       %lu\n", manager->stats.total_wakes);
-    printf("Total Requeues:    %lu\n", manager->stats.total_requeues);
-    printf("Failed Waits:      %lu\n", manager->stats.failed_waits);
-    printf("Timeout Waits:     %lu\n", manager->stats.timeout_waits);
-    printf("Avg Wait Time:     %.2f ms\n", manager->stats.avg_wait_time);
+    for (size_t i = 0; i < manager->nr_cpus; i++) {
+        pthread_mutex_lock(&manager->cpus[i].queue->lock);
+        size_t count = manager->cpus[i].queue->count;
+        if (count > max_tasks) {
+            max_tasks = count;
+            max_cpu = i;
+        }
+        if (count < min_tasks) {
+            min_tasks = count;
+            min_cpu = i;
+        }
+        pthread_mutex_unlock(&manager->cpus[i].queue->lock);
+    }
 
-    pthread_mutex_unlock(&manager->manager_lock);
+    // Balance if necessary
+    if (max_tasks - min_tasks > 1) {
+        cpu_t *src_cpu = &manager->cpus[max_cpu];
+        cpu_t *dst_cpu = &manager->cpus[min_cpu];
+
+        pthread_mutex_lock(&src_cpu->queue->lock);
+        pthread_mutex_lock(&dst_cpu->queue->lock);
+
+        // Move task from most loaded to least loaded CPU
+        if (src_cpu->queue->head) {
+            task_t *task = src_cpu->queue->head;
+            src_cpu->queue->head = task->next;
+            src_cpu->queue->count--;
+
+            task->next = dst_cpu->queue->head;
+            dst_cpu->queue->head = task;
+            dst_cpu->queue->count++;
+            task->cpu = min_cpu;
+
+            manager->stats.migrations++;
+        }
+
+        pthread_mutex_unlock(&dst_cpu->queue->lock);
+        pthread_mutex_unlock(&src_cpu->queue->lock);
+
+        manager->stats.load_balances++;
+    }
 }
 
-// Destroy Futex Queue
-void destroy_queue(futex_queue_t *queue) {
+// Run Test
+void run_test(sched_manager_t *manager) {
+    if (!manager) return;
+
+    LOG(LOG_LEVEL_INFO, "Starting scheduler test...");
+
+    // Create initial tasks
+    for (size_t i = 0; i < MAX_TASKS/2; i++) {
+        task_t *task = create_task(TASK_NORMAL, rand() % MAX_PRIORITY);
+        if (task) {
+            task->deadline = (rand() % 10 + 1) * DEFAULT_TIMESLICE;
+            schedule_task(manager, task);
+            manager->tasks[manager->nr_tasks++] = task;
+            manager->stats.total_tasks++;
+        }
+    }
+
+    // Start CPU threads
+    manager->running = true;
+    void *thread_args[2];
+    thread_args[1] = manager;
+
+    for (size_t i = 0; i < manager->nr_cpus; i++) {
+        thread_args[0] = &manager->cpus[i];
+        pthread_create(&manager->cpus[i].thread, NULL, cpu_thread, thread_args);
+    }
+
+    // Start load balancer
+    pthread_create(&manager->load_balancer, NULL, load_balancer_thread, manager);
+
+    // Run test
+    time_t start_time = time(NULL);
+    while (time(NULL) - start_time < TEST_DURATION) {
+        // Periodically add new tasks
+        if (manager->nr_tasks < MAX_TASKS && rand() % 100 < 10) {
+            task_t *task = create_task(
+                rand() % 10 == 0 ? TASK_RT : TASK_NORMAL,
+                rand() % MAX_PRIORITY
+            );
+            if (task) {
+                task->deadline = (rand() % 10 + 1) * DEFAULT_TIMESLICE;
+                schedule_task(manager, task);
+                manager->tasks[manager->nr_tasks++] = task;
+                manager->stats.total_tasks++;
+            }
+        }
+        usleep(100000);  // 100ms
+    }
+
+    // Stop threads
+    manager->running = false;
+
+    // Wait for threads to finish
+    for (size_t i = 0; i < manager->nr_cpus; i++) {
+        pthread_join(manager->cpus[i].thread, NULL);
+    }
+    pthread_join(manager->load_balancer, NULL);
+
+    // Calculate statistics
+    calculate_stats(manager);
+}
+
+// Calculate Statistics
+void calculate_stats(sched_manager_t *manager) {
+    if (!manager) return;
+
+    uint64_t total_runtime = 0;
+    uint64_t total_latency = 0;
+    uint64_t total_busy_time = 0;
+
+    for (size_t i = 0; i < manager->nr_tasks; i++) {
+        if (manager->tasks[i]) {
+            total_runtime += manager->tasks[i]->runtime;
+            total_latency += manager->tasks[i]->runtime - manager->tasks[i]->deadline;
+        }
+    }
+
+    for (size_t i = 0; i < manager->nr_cpus; i++) {
+        total_busy_time += manager->cpus[i].busy_time;
+    }
+
+    if (manager->stats.completed_tasks > 0) {
+        manager->stats.avg_latency = 
+            (double)total_latency / manager->stats.completed_tasks;
+    }
+
+    manager->stats.cpu_utilization = 
+        (double)total_busy_time / (TEST_DURATION * 1000000 * manager->nr_cpus);
+
+    // Calculate load imbalance
+    size_t max_queue = 0, min_queue = UINT64_MAX;
+    for (size_t i = 0; i < manager->nr_cpus; i++) {
+        size_t count = manager->cpus[i].queue->count;
+        if (count > max_queue) max_queue = count;
+        if (count < min_queue) min_queue = count;
+    }
+    manager->stats.load_imbalance = max_queue - min_queue;
+
+    manager->stats.test_duration = TEST_DURATION;
+}
+
+// Print Test Statistics
+void print_test_stats(sched_manager_t *manager) {
+    if (!manager) return;
+
+    printf("\nScheduler Test Results:\n");
+    printf("-------------------------\n");
+    printf("Test Duration:      %.2f seconds\n", manager->stats.test_duration);
+    printf("Total Tasks:        %lu\n", manager->stats.total_tasks);
+    printf("Completed Tasks:    %lu\n", manager->stats.completed_tasks);
+    printf("Context Switches:   %lu\n", manager->stats.context_switches);
+    printf("Task Migrations:    %lu\n", manager->stats.migrations);
+    printf("Load Balances:      %lu\n", manager->stats.load_balances);
+    printf("Avg Task Latency:   %.2f us\n", manager->stats.avg_latency);
+    printf("CPU Utilization:    %.2f%%\n", manager->stats.cpu_utilization * 100);
+    printf("Load Imbalance:     %.2f\n", manager->stats.load_imbalance);
+
+    // Print CPU details
+    printf("\nCPU Details:\n");
+    for (size_t i = 0; i < manager->nr_cpus; i++) {
+        cpu_t *cpu = &manager->cpus[i];
+        printf("  CPU %zu:\n", i);
+        printf("    State:     %s\n", get_cpu_state_string(cpu->state));
+        printf("    Queue Size: %zu\n", cpu->queue->count);
+        printf("    Busy Time:  %lu us\n", cpu->busy_time);
+        printf("    Idle Time:  %lu us\n", cpu->idle_time);
+    }
+}
+
+// Destroy Task
+void destroy_task(task_t *task) {
+    free(task);
+}
+
+// Destroy Run Queue
+void destroy_run_queue(run_queue_t *queue) {
     if (!queue) return;
 
-    // Free all waiters
-    futex_waiter_t *waiter = queue->waiters;
-    while (waiter) {
-        futex_waiter_t *next = waiter->next;
-        free(waiter);
-        waiter = next;
+    task_t *current = queue->head;
+    while (current) {
+        task_t *next = current->next;
+        destroy_task(current);
+        current = next;
     }
 
     pthread_mutex_destroy(&queue->lock);
     free(queue);
 }
 
-// Destroy Futex Manager
-void destroy_futex_manager(futex_manager_t *manager) {
+// Destroy Scheduler Manager
+void destroy_sched_manager(sched_manager_t *manager) {
     if (!manager) return;
 
-    pthread_mutex_lock(&manager->manager_lock);
-
-    // Destroy all queues
-    futex_queue_t *queue = manager->queues;
-    while (queue) {
-        futex_queue_t *next = queue->next;
-        destroy_queue(queue);
-        queue = next;
+    // Clean up tasks
+    for (size_t i = 0; i < manager->nr_tasks; i++) {
+        destroy_task(manager->tasks[i]);
     }
 
-    pthread_mutex_unlock(&manager->manager_lock);
+    // Clean up CPUs
+    for (size_t i = 0; i < manager->nr_cpus; i++) {
+        pthread_mutex_destroy(&manager->cpus[i].lock);
+        destroy_run_queue(manager->cpus[i].queue);
+    }
+
     pthread_mutex_destroy(&manager->manager_lock);
-
     free(manager);
-    LOG(LOG_LEVEL_DEBUG, "Destroyed futex manager");
+    LOG(LOG_LEVEL_DEBUG, "Destroyed scheduler manager");
 }
 
-// Thread function for demonstration
-void* worker_thread(void *arg) {
-    futex_manager_t *manager = (futex_manager_t*)arg;
-    uint32_t futex_val = 0;
-    struct timespec timeout = {.tv_sec = 1, .tv_nsec = 0};
+// Demonstrate Scheduler
+void demonstrate_scheduler(void) {
+    printf("Starting scheduler demonstration...\n");
 
-    // Simulate futex wait
-    LOG(LOG_LEVEL_INFO, "Thread %lu waiting on futex",
-        (unsigned long)pthread_self());
-    
-    futex_wait(manager, &futex_val, 0, &timeout);
-
-    return NULL;
-}
-
-// Demonstrate Futex
-void demonstrate_futex(void) {
-    // Create futex configuration
-    futex_config_t config = {
-        .max_queues = 100,
-        .max_waiters = 1000,
-        .track_stats = true,
-        .requeue_batch = 10
-    };
-
-    // Create futex manager
-    futex_manager_t *manager = create_futex_manager(config);
-    if (!manager) return;
-
-    // Create worker threads
-    pthread_t threads[5];
-    uint32_t futex_val = 0;
-
-    for (int i = 0; i < 5; i++) {
-        pthread_create(&threads[i], NULL, worker_thread, manager);
+    // Create and run scheduler test
+    sched_manager_t *manager = create_sched_manager(8);
+    if (manager) {
+        run_test(manager);
+        print_test_stats(manager);
+        destroy_sched_manager(manager);
     }
-
-    // Sleep briefly
-    usleep(100000);
-
-    // Wake some threads
-    LOG(LOG_LEVEL_INFO, "Waking 3 threads");
-    futex_wake(manager, &futex_val, 3);
-
-    // Sleep briefly
-    usleep(100000);
-
-    // Requeue remaining threads
-    uint32_t futex_val2 = 0;
-    LOG(LOG_LEVEL_INFO, "Requeuing remaining threads");
-    futex_requeue(manager, &futex_val, &futex_val2, 1, 1);
-
-    // Wait for threads to complete
-    for (int i = 0; i < 5; i++) {
-        pthread_join(threads[i], NULL);
-    }
-
-    // Print statistics
-    print_futex_stats(manager);
-
-    // Cleanup
-    destroy_futex_manager(manager);
 }
 
 int main(void) {
     // Set log level
     current_log_level = LOG_LEVEL_INFO;
 
+    // Seed random number generator
+    srand(time(NULL));
+
     // Run demonstration
-    demonstrate_futex();
+    demonstrate_scheduler();
 
     return 0;
 }
